@@ -1,0 +1,123 @@
+name: Android Browser Emulator
+
+on:
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          echo "Checking KVM..."
+          ls -l /dev/kvm || true
+
+      - name: Install Android SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "emulator" \
+            "system-images;android-35;google_apis;x86_64"
+
+      - name: Create AVD
+        run: |
+          echo "no" | avdmanager create avd \
+            -n browser-phone \
+            -k "system-images;android-35;google_apis;x86_64" \
+            --device "pixel_7_pro" \
+            --force
+
+      - name: Start Android Emulator
+        run: |
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+
+          emulator -list-avds
+
+          nohup emulator \
+            -avd browser-phone \
+            -no-window \
+            -no-audio \
+            -no-boot-anim \
+            -gpu swiftshader_indirect \
+            -no-snapshot \
+            > "$HOME/emulator.log" 2>&1 &
+
+          echo $! > "$HOME/emulator.pid"
+
+      - name: Wait for Android
+        run: |
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+
+          adb wait-for-device
+
+          for i in {1..120}; do
+            BOOTED="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
+
+            if [ "$BOOTED" = "1" ]; then
+              echo "Android is ready!"
+              break
+            fi
+
+            echo "Waiting for Android... $i/120"
+            sleep 2
+          done
+
+          adb shell input keyevent 82 || true
+
+          echo "Connected devices:"
+          adb devices
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install serve-avd
+        run: |
+          npm install -g serve-avd
+
+      - name: Start serve-avd
+        run: |
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+
+          nohup serve-avd \
+            --host 0.0.0.0 \
+            --port 3200 \
+            > "$HOME/serve-avd.log" 2>&1 &
+
+          echo $! > "$HOME/serve-avd.pid"
+
+          sleep 5
+
+          echo "===== serve-avd log ====="
+          cat "$HOME/serve-avd.log" || true
+
+      - name: Keep emulator alive
+        run: |
+          echo "Android browser emulator is running."
+          echo "The next step is exposing port 3200."
+
+          while true; do
+            echo "===== $(date) ====="
+            adb devices || true
+            echo "===== serve-avd ====="
+            cat "$HOME/serve-avd.log" 2>/dev/null || true
+            sleep 60
+          done
