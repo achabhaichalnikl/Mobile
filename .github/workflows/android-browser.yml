@@ -12,76 +12,180 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Enable KVM
+      - name: Locate Android SDK
+        shell: bash
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          set -e
 
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
 
-          echo "Checking KVM..."
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+
+          if [ ! -d "$SDK" ]; then
+            echo "Android SDK not found at: $SDK"
+            exit 1
+          fi
+
+          echo "Using Android SDK: $SDK"
+
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK/emulator" >> "$GITHUB_PATH"
+
+          # Find sdkmanager
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager was not found."
+            echo "Contents of cmdline-tools:"
+            find "$SDK/cmdline-tools" -maxdepth 3 -type f 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+
+          SDKMANAGER_DIR="$(dirname "$SDKMANAGER")"
+          echo "$SDKMANAGER_DIR" >> "$GITHUB_PATH"
+
+          echo "sdkmanager found:"
+          "$SDKMANAGER" --version
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-kvm
+
+          sudo usermod -aG kvm "$USER" || true
+
+          echo "===== KVM ====="
           ls -l /dev/kvm || true
 
-      - name: Install Android SDK
-        run: |
-          yes | sdkmanager --licenses >/dev/null || true
+          if [ -e /dev/kvm ]; then
+            echo "KVM device exists."
+          else
+            echo "WARNING: /dev/kvm is unavailable."
+            echo "Android may have to use software rendering."
+          fi
 
-          sdkmanager \
+      - name: Install Android components
+        shell: bash
+        run: |
+          set -e
+
+          echo "Using sdkmanager:"
+          "$SDKMANAGER" --version
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-35" \
             "emulator" \
             "system-images;android-35;google_apis;x86_64"
 
-      - name: Create AVD
+      - name: Verify Android tools
+        shell: bash
         run: |
+          set -e
+
+          echo "===== adb ====="
+          adb version
+
+          echo "===== emulator ====="
+          emulator -version
+
+          echo "===== installed system images ====="
+          "$SDKMANAGER" --list_installed || true
+
+      - name: Create Android AVD
+        shell: bash
+        run: |
+          set -e
+
           echo "no" | avdmanager create avd \
             -n browser-phone \
             -k "system-images;android-35;google_apis;x86_64" \
             --device "pixel_7_pro" \
             --force
 
-      - name: Start Android Emulator
-        run: |
-          export ANDROID_HOME="$ANDROID_SDK_ROOT"
-          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-
+          echo "===== AVDs ====="
           emulator -list-avds
+
+      - name: Start Android Emulator
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p "$HOME/android-logs"
+
+          EXTRA_ARGS=""
+
+          if [ -e /dev/kvm ]; then
+            echo "KVM available."
+          else
+            echo "KVM unavailable. Using software acceleration."
+            EXTRA_ARGS="-accel off"
+          fi
 
           nohup emulator \
             -avd browser-phone \
             -no-window \
             -no-audio \
             -no-boot-anim \
-            -gpu swiftshader_indirect \
             -no-snapshot \
-            > "$HOME/emulator.log" 2>&1 &
+            -gpu swiftshader_indirect \
+            $EXTRA_ARGS \
+            > "$HOME/android-logs/emulator.log" 2>&1 &
 
-          echo $! > "$HOME/emulator.pid"
+          echo $! > "$HOME/android-logs/emulator.pid"
 
-      - name: Wait for Android
+          echo "Emulator PID:"
+          cat "$HOME/android-logs/emulator.pid"
+
+      - name: Wait for Android boot
+        shell: bash
         run: |
-          export ANDROID_HOME="$ANDROID_SDK_ROOT"
-          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          set -e
 
           adb wait-for-device
 
-          for i in {1..120}; do
-            BOOTED="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
+          echo "Android device detected."
+
+          for i in {1..180}; do
+            BOOTED="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
 
             if [ "$BOOTED" = "1" ]; then
-              echo "Android is ready!"
+              echo "================================"
+              echo "ANDROID BOOTED SUCCESSFULLY"
+              echo "================================"
               break
             fi
 
-            echo "Waiting for Android... $i/120"
+            if [ "$i" -eq 180 ]; then
+              echo "Android failed to boot."
+              echo "===== Emulator log ====="
+              cat "$HOME/android-logs/emulator.log" || true
+              exit 1
+            fi
+
+            echo "Waiting for Android boot... $i/180"
             sleep 2
           done
 
           adb shell input keyevent 82 || true
 
-          echo "Connected devices:"
+          echo "===== ADB DEVICES ====="
           adb devices
+
+          echo "===== Android version ====="
+          adb shell getprop ro.build.version.release
+
+          echo "===== API level ====="
+          adb shell getprop ro.build.version.sdk
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -89,35 +193,67 @@ jobs:
           node-version: 20
 
       - name: Install serve-avd
+        shell: bash
         run: |
+          set -e
+
           npm install -g serve-avd
 
+          echo "===== serve-avd ====="
+          command -v serve-avd || true
+          serve-avd --help || true
+
       - name: Start serve-avd
+        shell: bash
         run: |
-          export ANDROID_HOME="$ANDROID_SDK_ROOT"
-          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          set -e
+
+          mkdir -p "$HOME/android-logs"
 
           nohup serve-avd \
             --host 0.0.0.0 \
             --port 3200 \
-            > "$HOME/serve-avd.log" 2>&1 &
+            > "$HOME/android-logs/serve-avd.log" 2>&1 &
 
-          echo $! > "$HOME/serve-avd.pid"
+          echo $! > "$HOME/android-logs/serve-avd.pid"
 
-          sleep 5
+          sleep 10
+
+          echo "===== serve-avd process ====="
+          ps aux | grep serve-avd | grep -v grep || true
 
           echo "===== serve-avd log ====="
-          cat "$HOME/serve-avd.log" || true
+          cat "$HOME/android-logs/serve-avd.log" || true
+
+          echo "===== Port 3200 ====="
+          ss -lntp | grep 3200 || true
 
       - name: Keep emulator alive
+        shell: bash
         run: |
-          echo "Android browser emulator is running."
-          echo "The next step is exposing port 3200."
+          echo "========================================="
+          echo "ANDROID EMULATOR IS RUNNING"
+          echo "========================================="
+          echo "serve-avd port: 3200"
+          echo ""
 
           while true; do
             echo "===== $(date) ====="
+
+            echo "--- ADB ---"
             adb devices || true
-            echo "===== serve-avd ====="
-            cat "$HOME/serve-avd.log" 2>/dev/null || true
+
+            echo "--- serve-avd ---"
+            ps aux | grep serve-avd | grep -v grep || true
+
+            echo "--- Port 3200 ---"
+            ss -lntp | grep 3200 || true
+
+            echo "--- Emulator log ---"
+            tail -n 20 "$HOME/android-logs/emulator.log" 2>/dev/null || true
+
+            echo "--- serve-avd log ---"
+            tail -n 20 "$HOME/android-logs/serve-avd.log" 2>/dev/null || true
+
             sleep 60
           done
